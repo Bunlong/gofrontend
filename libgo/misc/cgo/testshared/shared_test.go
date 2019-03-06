@@ -351,10 +351,10 @@ func readNotes(f *elf.File) ([]*note, error) {
 
 func dynStrings(t *testing.T, path string, flag elf.DynTag) []string {
 	f, err := elf.Open(path)
-	defer f.Close()
 	if err != nil {
 		t.Fatalf("elf.Open(%q) failed: %v", path, err)
 	}
+	defer f.Close()
 	dynstrings, err := f.DynString(flag)
 	if err != nil {
 		t.Fatalf("DynString(%s) failed on %s: %v", flag, path, err)
@@ -560,7 +560,7 @@ func TestNotes(t *testing.T) {
 			abiHashNoteFound = true
 		case 3: // ELF_NOTE_GODEPS_TAG
 			if depsNoteFound {
-				t.Error("multiple depedency list notes")
+				t.Error("multiple dependency list notes")
 			}
 			testDepsNote(t, f, note)
 			depsNoteFound = true
@@ -578,7 +578,7 @@ func TestNotes(t *testing.T) {
 }
 
 // Build a GOPATH package (depBase) into a shared library that links against the goroot
-// runtime, another package (dep2) that links against the first, and and an
+// runtime, another package (dep2) that links against the first, and an
 // executable that links against dep2.
 func TestTwoGopathShlibs(t *testing.T) {
 	goCmd(t, "install", "-buildmode=shared", "-linkshared", "depBase")
@@ -598,7 +598,6 @@ func TestThreeGopathShlibs(t *testing.T) {
 // If gccgo is not available or not new enough call t.Skip. Otherwise,
 // return a build.Context that is set up for gccgo.
 func prepGccgo(t *testing.T) build.Context {
-	t.Skip("golang.org/issue/22472")
 	gccgoName := os.Getenv("GCCGO")
 	if gccgoName == "" {
 		gccgoName = "gccgo"
@@ -648,8 +647,6 @@ func TestGoPathShlibGccgo(t *testing.T) {
 // library with gccgo, another GOPATH package that depends on the first and an
 // executable that links the second library.
 func TestTwoGopathShlibsGccgo(t *testing.T) {
-	t.Skip("golang.org/issue/22224")
-
 	gccgoContext := prepGccgo(t)
 
 	libgoRE := regexp.MustCompile("libgo.so.[0-9]+")
@@ -793,6 +790,7 @@ func TestRebuilding(t *testing.T) {
 	// If the .a file is newer than the .so, the .so is rebuilt (but not the .a)
 	t.Run("newarchive", func(t *testing.T) {
 		resetFileStamps()
+		AssertNotRebuilt(t, "new .a file before build", filepath.Join(gopathInstallDir, "depBase.a"))
 		goCmd(t, "list", "-linkshared", "-f={{.ImportPath}} {{.Stale}} {{.StaleReason}} {{.Target}}", "depBase")
 		AssertNotRebuilt(t, "new .a file before build", filepath.Join(gopathInstallDir, "depBase.a"))
 		cleanup := touch(t, filepath.Join(gopathInstallDir, "depBase.a"))
@@ -906,4 +904,16 @@ func TestGlobal(t *testing.T) {
 	run(t, "global executable", "./bin/global")
 	AssertIsLinkedTo(t, "./bin/global", soname)
 	AssertHasRPath(t, "./bin/global", gorootInstallDir)
+}
+
+// Run a test using -linkshared of an installed shared package.
+// Issue 26400.
+func TestTestInstalledShared(t *testing.T) {
+	goCmd(nil, "test", "-linkshared", "-test.short", "sync/atomic")
+}
+
+// Test generated pointer method with -linkshared.
+// Issue 25065.
+func TestGeneratedMethod(t *testing.T) {
+	goCmd(t, "install", "-buildmode=shared", "-linkshared", "issue25065")
 }

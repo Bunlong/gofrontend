@@ -156,8 +156,8 @@ func (p *cpuProfile) addExtra() {
 	if p.lostExtra > 0 {
 		hdr := [1]uint64{p.lostExtra}
 		lostStk := [2]uintptr{
-			funcPC(_LostExternalCode) + sys.PCQuantum,
-			funcPC(_ExternalCode) + sys.PCQuantum,
+			_LostExternalCodePC + sys.PCQuantum,
+			_ExternalCodePC + sys.PCQuantum,
 		}
 		cpuprof.log.write(nil, 0, hdr[:], lostStk[:])
 		p.lostExtra = 0
@@ -167,8 +167,8 @@ func (p *cpuProfile) addExtra() {
 func (p *cpuProfile) addLostAtomic64(count uint64) {
 	hdr := [1]uint64{count}
 	lostStk := [2]uintptr{
-		funcPC(_LostSIGPROFDuringAtomic64) + sys.PCQuantum,
-		funcPC(_System) + sys.PCQuantum,
+		_LostSIGPROFDuringAtomic64PC + sys.PCQuantum,
+		_SystemPC + sys.PCQuantum,
 	}
 	cpuprof.log.write(nil, 0, hdr[:], lostStk[:])
 }
@@ -186,7 +186,7 @@ func CPUProfile() []byte {
 	panic("CPUProfile no longer available")
 }
 
-//go:linkname runtime_pprof_runtime_cyclesPerSecond runtime_pprof.runtime_cyclesPerSecond
+//go:linkname runtime_pprof_runtime_cyclesPerSecond runtime..z2fpprof.runtime_cyclesPerSecond
 func runtime_pprof_runtime_cyclesPerSecond() int64 {
 	return tickspersecond()
 }
@@ -197,7 +197,7 @@ func runtime_pprof_runtime_cyclesPerSecond() int64 {
 // on has been returned, readProfile returns eof=true.
 // The caller must save the returned data and tags before calling readProfile again.
 //
-//go:linkname runtime_pprof_readProfile runtime_pprof.readProfile
+//go:linkname runtime_pprof_readProfile runtime..z2fpprof.readProfile
 func runtime_pprof_readProfile() ([]uint64, []unsafe.Pointer, bool) {
 	lock(&cpuprof.lock)
 	log := cpuprof.log

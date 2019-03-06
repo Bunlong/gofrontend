@@ -6,13 +6,10 @@ package test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
-	"go/ast"
 	"go/build"
-	"go/doc"
-	"go/parser"
-	"go/token"
 	"io"
 	"io/ioutil"
 	"os"
@@ -24,15 +21,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
+	"cmd/go/internal/lockedfile"
+	"cmd/go/internal/modload"
 	"cmd/go/internal/str"
 	"cmd/go/internal/work"
 	"cmd/internal/test2json"
@@ -43,7 +39,7 @@ func init() {
 	CmdTest.Run = runTest
 }
 
-const testUsage = "test [build/test flags] [packages] [build/test flags & test binary flags]"
+const testUsage = "go test [build/test flags] [packages] [build/test flags & test binary flags]"
 
 var CmdTest = &base.Command{
 	CustomFlags: true,
@@ -75,55 +71,60 @@ to hold ancillary data needed by the tests.
 
 As part of building a test binary, go test runs go vet on the package
 and its test source files to identify significant problems. If go vet
-finds any problems, go test reports those and does not run the test binary.
-Only a high-confidence subset of the default go vet checks are used.
-To disable the running of go vet, use the -vet=off flag.
+finds any problems, go test reports those and does not run the test
+binary. Only a high-confidence subset of the default go vet checks are
+used. That subset is: 'atomic', 'bool', 'buildtags', 'nilfunc', and
+'printf'. You can see the documentation for these and other vet tests
+via "go doc cmd/vet". To disable the running of go vet, use the
+-vet=off flag.
 
-Go test runs in two different modes: local directory mode when invoked with
-no package arguments (for example, 'go test'), and package list mode when
-invoked with package arguments (for example 'go test math', 'go test ./...',
-and even 'go test .').
+All test output and summary lines are printed to the go command's
+standard output, even if the test printed them to its own standard
+error. (The go command's standard error is reserved for printing
+errors building the tests.)
 
-In local directory mode, go test compiles and tests the package sources
-found in the current directory and then runs the resulting test binary.
-In this mode, caching (discussed below) is disabled. After the package test
-finishes, go test prints a summary line showing the test status ('ok' or 'FAIL'),
-package name, and elapsed time.
+Go test runs in two different modes:
 
-In package list mode, go test compiles and tests each of the packages
-listed on the command line. If a package test passes, go test prints only
-the final 'ok' summary line. If a package test fails, go test prints the
-full test output. If invoked with the -bench or -v flag, go test prints
-the full output even for passing package tests, in order to display the
+The first, called local directory mode, occurs when go test is
+invoked with no package arguments (for example, 'go test' or 'go
+test -v'). In this mode, go test compiles the package sources and
+tests found in the current directory and then runs the resulting
+test binary. In this mode, caching (discussed below) is disabled.
+After the package test finishes, go test prints a summary line
+showing the test status ('ok' or 'FAIL'), package name, and elapsed
+time.
+
+The second, called package list mode, occurs when go test is invoked
+with explicit package arguments (for example 'go test math', 'go
+test ./...', and even 'go test .'). In this mode, go test compiles
+and tests each of the packages listed on the command line. If a
+package test passes, go test prints only the final 'ok' summary
+line. If a package test fails, go test prints the full test output.
+If invoked with the -bench or -v flag, go test prints the full
+output even for passing package tests, in order to display the
 requested benchmark results or verbose logging.
 
-All test output and summary lines are printed to the go command's standard
-output, even if the test printed them to its own standard error.
-(The go command's standard error is reserved for printing errors building
-the tests.)
+In package list mode only, go test caches successful package test
+results to avoid unnecessary repeated running of tests. When the
+result of a test can be recovered from the cache, go test will
+redisplay the previous output instead of running the test binary
+again. When this happens, go test prints '(cached)' in place of the
+elapsed time in the summary line.
 
-In package list mode, go test also caches successful package test results.
-If go test has cached a previous test run using the same test binary and
-the same command line consisting entirely of cacheable test flags
-(defined as -cpu, -list, -parallel, -run, -short, and -v),
-go test will redisplay the previous output instead of running the test
-binary again. In the summary line, go test prints '(cached)' in place of
-the elapsed time. To disable test caching, use any test flag or argument
-other than the cacheable flags. The idiomatic way to disable test caching
-explicitly is to use -count=1. A cached result is treated as executing in
-no time at all, so a successful package test result will be cached and reused
+The rule for a match in the cache is that the run involves the same
+test binary and the flags on the command line come entirely from a
+restricted set of 'cacheable' test flags, defined as -cpu, -list,
+-parallel, -run, -short, and -v. If a run of go test has any test
+or non-test flags outside this set, the result is not cached. To
+disable test caching, use any test flag or argument other than the
+cacheable flags. The idiomatic way to disable test caching explicitly
+is to use -count=1. Tests that open files within the package's source
+root (usually $GOPATH) or that consult environment variables only
+match future runs in which the files and environment variables are unchanged.
+A cached test result is treated as executing in no time at all,
+so a successful package test result will be cached and reused
 regardless of -timeout setting.
 
-` + strings.TrimSpace(testFlag1) + ` See 'go help testflag' for details.
-
-For more about build flags, see 'go help build'.
-For more about specifying packages, see 'go help packages'.
-
-See also: go build, go vet.
-`,
-}
-
-const testFlag1 = `
 In addition to the build flags, the flags handled by 'go test' itself are:
 
 	-args
@@ -154,20 +155,18 @@ In addition to the build flags, the flags handled by 'go test' itself are:
 	    The test still runs (unless -c or -i is specified).
 
 The test binary also accepts flags that control execution of the test; these
-flags are also accessible by 'go test'.
-`
+flags are also accessible by 'go test'. See 'go help testflag' for details.
 
-// Usage prints the usage message for 'go test -h' and exits.
-func Usage() {
-	os.Stderr.WriteString(testUsage + "\n\n" +
-		strings.TrimSpace(testFlag1) + "\n\n\t" +
-		strings.TrimSpace(testFlag2) + "\n")
-	os.Exit(2)
+For more about build flags, see 'go help build'.
+For more about specifying packages, see 'go help packages'.
+
+See also: go build, go vet.
+`,
 }
 
 var HelpTestflag = &base.Command{
 	UsageLine: "testflag",
-	Short:     "description of testing flags",
+	Short:     "testing flags",
 	Long: `
 The 'go test' command takes both flags that apply to 'go test' itself
 and flags that apply to the resulting test binary.
@@ -180,11 +179,6 @@ options of pprof control how the information is presented.
 The following flags are recognized by the 'go test' command and
 control the execution of any test:
 
-	` + strings.TrimSpace(testFlag2) + `
-`,
-}
-
-const testFlag2 = `
 	-bench regexp
 	    Run only those benchmarks matching a regular expression.
 	    By default, no benchmarks are run.
@@ -202,6 +196,8 @@ const testFlag2 = `
 	    Run enough iterations of each benchmark to take t, specified
 	    as a time.Duration (for example, -benchtime 1h30s).
 	    The default is 1 second (1s).
+	    The special syntax Nx means to run the benchmark N times
+	    (for example, -benchtime 100x).
 
 	-count n
 	    Run each test and benchmark n times (default 1).
@@ -315,14 +311,13 @@ profile the tests during execution:
 	    Writes test binary as -c would.
 
 	-memprofile mem.out
-	    Write a memory profile to the file after all tests have passed.
+	    Write an allocation profile to the file after all tests have passed.
 	    Writes test binary as -c would.
 
 	-memprofilerate n
-	    Enable more precise (and expensive) memory profiles by setting
-	    runtime.MemProfileRate. See 'go doc runtime.MemProfileRate'.
-	    To profile all memory allocations, use -test.memprofilerate=1
-	    and pass --alloc_space flag to the pprof tool.
+	    Enable more precise (and expensive) memory allocation profiles by
+	    setting runtime.MemProfileRate. See 'go doc runtime.MemProfileRate'.
+	    To profile all memory allocations, use -test.memprofilerate=1.
 
 	-mutexprofile mutex.out
 	    Write a mutex contention profile to the specified file
@@ -372,6 +367,12 @@ flag not known to the go test command. Continuing the example above,
 the package list would have to appear before -myflag, but could appear
 on either side of -v.
 
+When 'go test' runs in package list mode, 'go test' caches successful
+package test results to avoid unnecessary repeated running of tests. To
+disable test caching, use any test flag or argument other than the
+cacheable flags. The idiomatic way to disable test caching explicitly
+is to use -count=1.
+
 To keep an argument for a test binary from being interpreted as a
 known flag or a package name, use -args (see 'go help test') which
 passes the remainder of the command line through to the test binary
@@ -397,11 +398,12 @@ In the first example, the -x and the second -v are passed through to the
 test binary unchanged and with no effect on the go command itself.
 In the second example, the argument math is passed through to the test
 binary, instead of being interpreted as the package list.
-`
+`,
+}
 
 var HelpTestfunc = &base.Command{
 	UsageLine: "testfunc",
-	Short:     "description of testing functions",
+	Short:     "testing functions",
 	Long: `
 The 'go test' command expects to find test, benchmark, and example functions
 in the "*_test.go" files corresponding to the package under test.
@@ -486,13 +488,6 @@ var (
 	testCacheExpire time.Time // ignore cached test results before this time
 )
 
-var testMainDeps = []string{
-	// Dependencies for testmain.
-	"os",
-	"testing",
-	"testing/internal/testdeps",
-}
-
 // testVetFlags is the list of flags to pass to vet when invoked automatically during go test.
 var testVetFlags = []string{
 	// TODO(rsc): Decide which tests are enabled by default.
@@ -520,7 +515,9 @@ var testVetFlags = []string{
 }
 
 func runTest(cmd *base.Command, args []string) {
-	pkgArgs, testArgs = testFlags(args)
+	modload.LoadTests = true
+
+	pkgArgs, testArgs = testFlags(cmd.Usage, args)
 
 	work.FindExecCmd() // initialize cached result
 
@@ -570,7 +567,7 @@ func runTest(cmd *base.Command, args []string) {
 	// (We implement go clean -testcache by writing an expiration date
 	// instead of searching out and deleting test result cache entries.)
 	if dir := cache.DefaultDir(); dir != "off" {
-		if data, _ := ioutil.ReadFile(filepath.Join(dir, "testexpire.txt")); len(data) > 0 && data[len(data)-1] == '\n' {
+		if data, _ := lockedfile.Read(filepath.Join(dir, "testexpire.txt")); len(data) > 0 && data[len(data)-1] == '\n' {
 			if t, err := strconv.ParseInt(string(data[:len(data)-1]), 10, 64); err == nil {
 				testCacheExpire = time.Unix(0, t)
 			}
@@ -584,7 +581,7 @@ func runTest(cmd *base.Command, args []string) {
 		cfg.BuildV = testV
 
 		deps := make(map[string]bool)
-		for _, dep := range testMainDeps {
+		for _, dep := range load.TestMainDeps {
 			deps[dep] = true
 		}
 
@@ -593,10 +590,10 @@ func runTest(cmd *base.Command, args []string) {
 			for _, path := range p.Imports {
 				deps[path] = true
 			}
-			for _, path := range p.Vendored(p.TestImports) {
+			for _, path := range p.Resolve(p.TestImports) {
 				deps[path] = true
 			}
-			for _, path := range p.Vendored(p.XTestImports) {
+			for _, path := range p.Resolve(p.XTestImports) {
 				deps[path] = true
 			}
 		}
@@ -620,6 +617,8 @@ func runTest(cmd *base.Command, args []string) {
 		a := &work.Action{Mode: "go test -i"}
 		for _, p := range load.PackagesForBuild(all) {
 			if cfg.BuildToolchainName == "gccgo" && p.Standard {
+				// gccgo's standard library packages
+				// can not be reinstalled.
 				continue
 			}
 			a.Deps = append(a.Deps, b.CompileAction(work.ModeInstall, work.ModeInstall, p))
@@ -641,7 +640,7 @@ func runTest(cmd *base.Command, args []string) {
 		}
 
 		// Select for coverage all dependencies matching the testCoverPaths patterns.
-		for _, p := range load.PackageList(pkgs) {
+		for _, p := range load.GetTestPackageList(pkgs) {
 			haveMatch := false
 			for i := range testCoverPaths {
 				if match[i](p) {
@@ -649,6 +648,23 @@ func runTest(cmd *base.Command, args []string) {
 					haveMatch = true
 				}
 			}
+
+			// Silently ignore attempts to run coverage on
+			// sync/atomic when using atomic coverage mode.
+			// Atomic coverage mode uses sync/atomic, so
+			// we can't also do coverage on it.
+			if testCoverMode == "atomic" && p.Standard && p.ImportPath == "sync/atomic" {
+				continue
+			}
+
+			// If using the race detector, silently ignore
+			// attempts to run coverage on the runtime
+			// packages. It will cause the race detector
+			// to be invoked before it has been initialized.
+			if cfg.BuildRace && p.Standard && (p.ImportPath == "runtime" || strings.HasPrefix(p.ImportPath, "runtime/internal")) {
+				continue
+			}
+
 			if haveMatch {
 				testCoverPkgs = append(testCoverPkgs, p)
 			}
@@ -672,7 +688,7 @@ func runTest(cmd *base.Command, args []string) {
 			coverFiles = append(coverFiles, p.GoFiles...)
 			coverFiles = append(coverFiles, p.CgoFiles...)
 			coverFiles = append(coverFiles, p.TestGoFiles...)
-			p.Internal.CoverVars = declareCoverVars(p.ImportPath, coverFiles...)
+			p.Internal.CoverVars = declareCoverVars(p, coverFiles...)
 			if testCover && testCoverMode == "atomic" {
 				ensureImport(p, "sync/atomic")
 			}
@@ -689,16 +705,13 @@ func runTest(cmd *base.Command, args []string) {
 		buildTest, runTest, printTest, err := builderTest(&b, p)
 		if err != nil {
 			str := err.Error()
-			if strings.HasPrefix(str, "\n") {
-				str = str[1:]
-			}
-			failed := fmt.Sprintf("FAIL\t%s [setup failed]\n", p.ImportPath)
-
+			str = strings.TrimPrefix(str, "\n")
 			if p.ImportPath != "" {
-				base.Errorf("# %s\n%s\n%s", p.ImportPath, str, failed)
+				base.Errorf("# %s\n%s", p.ImportPath, str)
 			} else {
-				base.Errorf("%s\n%s", str, failed)
+				base.Errorf("%s", str)
 			}
+			fmt.Printf("FAIL\t%s [setup failed]\n", p.ImportPath)
 			continue
 		}
 		builds = append(builds, buildTest)
@@ -766,67 +779,23 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 	}
 
 	// Build Package structs describing:
+	//	pmain - pkg.test binary
 	//	ptest - package + test files
 	//	pxtest - package of external test files
-	//	pmain - pkg.test binary
-	var ptest, pxtest, pmain *load.Package
-
-	var imports, ximports []*load.Package
-	var stk load.ImportStack
-	stk.Push(p.ImportPath + " (test)")
-	rawTestImports := str.StringList(p.TestImports)
-	for i, path := range p.TestImports {
-		p1 := load.LoadImport(path, p.Dir, p, &stk, p.Internal.Build.TestImportPos[path], load.UseVendor)
-		if cfg.BuildToolchainName == "gccgo" && p1.Standard {
-			continue
+	var cover *load.TestCover
+	if testCover {
+		cover = &load.TestCover{
+			Mode:     testCoverMode,
+			Local:    testCover && testCoverPaths == nil,
+			Pkgs:     testCoverPkgs,
+			Paths:    testCoverPaths,
+			DeclVars: declareCoverVars,
 		}
-		if p1.Error != nil {
-			return nil, nil, nil, p1.Error
-		}
-		if len(p1.DepsErrors) > 0 {
-			err := p1.DepsErrors[0]
-			err.Pos = "" // show full import stack
-			return nil, nil, nil, err
-		}
-		if str.Contains(p1.Deps, p.ImportPath) || p1.ImportPath == p.ImportPath {
-			// Same error that loadPackage returns (via reusePackage) in pkg.go.
-			// Can't change that code, because that code is only for loading the
-			// non-test copy of a package.
-			err := &load.PackageError{
-				ImportStack:   testImportStack(stk[0], p1, p.ImportPath),
-				Err:           "import cycle not allowed in test",
-				IsImportCycle: true,
-			}
-			return nil, nil, nil, err
-		}
-		p.TestImports[i] = p1.ImportPath
-		imports = append(imports, p1)
 	}
-	stk.Pop()
-	stk.Push(p.ImportPath + "_test")
-	pxtestNeedsPtest := false
-	rawXTestImports := str.StringList(p.XTestImports)
-	for i, path := range p.XTestImports {
-		p1 := load.LoadImport(path, p.Dir, p, &stk, p.Internal.Build.XTestImportPos[path], load.UseVendor)
-		if cfg.BuildToolchainName == "gccgo" && p1.Standard {
-			continue
-		}
-		if p1.Error != nil {
-			return nil, nil, nil, p1.Error
-		}
-		if len(p1.DepsErrors) > 0 {
-			err := p1.DepsErrors[0]
-			err.Pos = "" // show full import stack
-			return nil, nil, nil, err
-		}
-		if p1.ImportPath == p.ImportPath {
-			pxtestNeedsPtest = true
-		} else {
-			ximports = append(ximports, p1)
-		}
-		p.XTestImports[i] = p1.ImportPath
+	pmain, ptest, pxtest, err := load.GetTestPackagesFor(p, cover)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	stk.Pop()
 
 	// Use last element of import path, not package name.
 	// They differ when package name is "main".
@@ -840,194 +809,18 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 	}
 	testBinary := elem + ".test"
 
-	// Should we apply coverage analysis locally,
-	// only for this package and only for this test?
-	// Yes, if -cover is on but -coverpkg has not specified
-	// a list of packages for global coverage.
-	localCover := testCover && testCoverPaths == nil
-
-	// Test package.
-	if len(p.TestGoFiles) > 0 || localCover || p.Name == "main" {
-		ptest = new(load.Package)
-		*ptest = *p
-		ptest.GoFiles = nil
-		ptest.GoFiles = append(ptest.GoFiles, p.GoFiles...)
-		ptest.GoFiles = append(ptest.GoFiles, p.TestGoFiles...)
-		ptest.Target = ""
-		// Note: The preparation of the vet config requires that common
-		// indexes in ptest.Imports, ptest.Internal.Imports, and ptest.Internal.RawImports
-		// all line up (but RawImports can be shorter than the others).
-		// That is, for 0 ≤ i < len(RawImports),
-		// RawImports[i] is the import string in the program text,
-		// Imports[i] is the expanded import string (vendoring applied or relative path expanded away),
-		// and Internal.Imports[i] is the corresponding *Package.
-		// Any implicitly added imports appear in Imports and Internal.Imports
-		// but not RawImports (because they were not in the source code).
-		// We insert TestImports, imports, and rawTestImports at the start of
-		// these lists to preserve the alignment.
-		ptest.Imports = str.StringList(p.TestImports, p.Imports)
-		ptest.Internal.Imports = append(imports, p.Internal.Imports...)
-		ptest.Internal.RawImports = str.StringList(rawTestImports, p.Internal.RawImports)
-		ptest.Internal.ForceLibrary = true
-		ptest.Internal.Build = new(build.Package)
-		*ptest.Internal.Build = *p.Internal.Build
-		m := map[string][]token.Position{}
-		for k, v := range p.Internal.Build.ImportPos {
-			m[k] = append(m[k], v...)
-		}
-		for k, v := range p.Internal.Build.TestImportPos {
-			m[k] = append(m[k], v...)
-		}
-		ptest.Internal.Build.ImportPos = m
-
-		if localCover {
-			ptest.Internal.CoverMode = testCoverMode
-			var coverFiles []string
-			coverFiles = append(coverFiles, ptest.GoFiles...)
-			coverFiles = append(coverFiles, ptest.CgoFiles...)
-			ptest.Internal.CoverVars = declareCoverVars(ptest.ImportPath, coverFiles...)
-		}
-	} else {
-		ptest = p
-	}
-
-	// External test package.
-	if len(p.XTestGoFiles) > 0 {
-		pxtest = &load.Package{
-			PackagePublic: load.PackagePublic{
-				Name:       p.Name + "_test",
-				ImportPath: p.ImportPath + "_test",
-				Root:       p.Root,
-				Dir:        p.Dir,
-				GoFiles:    p.XTestGoFiles,
-				Imports:    p.XTestImports,
-			},
-			Internal: load.PackageInternal{
-				LocalPrefix: p.Internal.LocalPrefix,
-				Build: &build.Package{
-					ImportPos: p.Internal.Build.XTestImportPos,
-				},
-				Imports:    ximports,
-				RawImports: rawXTestImports,
-
-				Asmflags:   p.Internal.Asmflags,
-				Gcflags:    p.Internal.Gcflags,
-				Ldflags:    p.Internal.Ldflags,
-				Gccgoflags: p.Internal.Gccgoflags,
-			},
-		}
-		if pxtestNeedsPtest {
-			pxtest.Internal.Imports = append(pxtest.Internal.Imports, ptest)
-		}
-	}
-
 	testDir := b.NewObjdir()
 	if err := b.Mkdir(testDir); err != nil {
 		return nil, nil, nil, err
 	}
 
-	// Action for building pkg.test.
-	pmain = &load.Package{
-		PackagePublic: load.PackagePublic{
-			Name:       "main",
-			Dir:        testDir,
-			GoFiles:    []string{"_testmain.go"},
-			ImportPath: p.ImportPath + " (testmain)",
-			Root:       p.Root,
-		},
-		Internal: load.PackageInternal{
-			Build:     &build.Package{Name: "main"},
-			OmitDebug: !testC && !testNeedBinary,
-
-			Asmflags:   p.Internal.Asmflags,
-			Gcflags:    p.Internal.Gcflags,
-			Ldflags:    p.Internal.Ldflags,
-			Gccgoflags: p.Internal.Gccgoflags,
-		},
-	}
-
-	// The generated main also imports testing, regexp, and os.
-	// Also the linker introduces implicit dependencies reported by LinkerDeps.
-	stk.Push("testmain")
-	deps := testMainDeps // cap==len, so safe for append
-	for _, d := range load.LinkerDeps(p) {
-		deps = append(deps, d)
-	}
-	for _, dep := range deps {
-		if dep == ptest.ImportPath {
-			pmain.Internal.Imports = append(pmain.Internal.Imports, ptest)
-		} else {
-			p1 := load.LoadImport(dep, "", nil, &stk, nil, 0)
-			if cfg.BuildToolchainName == "gccgo" && p1.Standard {
-				continue
-			}
-			if p1.Error != nil {
-				return nil, nil, nil, p1.Error
-			}
-			pmain.Internal.Imports = append(pmain.Internal.Imports, p1)
-		}
-	}
-
-	if testCoverPkgs != nil {
-		// Add imports, but avoid duplicates.
-		seen := map[*load.Package]bool{p: true, ptest: true}
-		for _, p1 := range pmain.Internal.Imports {
-			seen[p1] = true
-		}
-		for _, p1 := range testCoverPkgs {
-			if !seen[p1] {
-				seen[p1] = true
-				pmain.Internal.Imports = append(pmain.Internal.Imports, p1)
-			}
-		}
-	}
-
-	// Do initial scan for metadata needed for writing _testmain.go
-	// Use that metadata to update the list of imports for package main.
-	// The list of imports is used by recompileForTest and by the loop
-	// afterward that gathers t.Cover information.
-	t, err := loadTestFuncs(ptest)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if len(ptest.GoFiles)+len(ptest.CgoFiles) > 0 {
-		pmain.Internal.Imports = append(pmain.Internal.Imports, ptest)
-		t.ImportTest = true
-	}
-	if pxtest != nil {
-		pmain.Internal.Imports = append(pmain.Internal.Imports, pxtest)
-		t.ImportXtest = true
-	}
-
-	if ptest != p && localCover {
-		// We have made modifications to the package p being tested
-		// and are rebuilding p (as ptest).
-		// Arrange to rebuild all packages q such that
-		// the test depends on q and q depends on p.
-		// This makes sure that q sees the modifications to p.
-		// Strictly speaking, the rebuild is only necessary if the
-		// modifications to p change its export metadata, but
-		// determining that is a bit tricky, so we rebuild always.
-		// TODO(rsc): Once we get export metadata changes
-		// handled properly, look into the expense of dropping
-		// "&& localCover" above.
-		//
-		// This will cause extra compilation, so for now we only do it
-		// when testCover is set. The conditions are more general, though,
-		// and we may find that we need to do it always in the future.
-		recompileForTest(pmain, p, ptest, pxtest)
-	}
-
-	for _, cp := range pmain.Internal.Imports {
-		if len(cp.Internal.CoverVars) > 0 {
-			t.Cover = append(t.Cover, coverInfo{cp, cp.Internal.CoverVars})
-		}
-	}
+	pmain.Dir = testDir
+	pmain.Internal.OmitDebug = !testC && !testNeedBinary
 
 	if !cfg.BuildN {
 		// writeTestmain writes _testmain.go,
 		// using the test description gathered in t.
-		if err := writeTestmain(testDir+"_testmain.go", t); err != nil {
+		if err := ioutil.WriteFile(testDir+"_testmain.go", *pmain.Internal.TestmainGo, 0666); err != nil {
 			return nil, nil, nil, err
 		}
 	}
@@ -1079,18 +872,24 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 				target = filepath.Join(base.Cwd, target)
 			}
 		}
-		pmain.Target = target
-		installAction = &work.Action{
-			Mode:    "test build",
-			Func:    work.BuildInstallFunc,
-			Deps:    []*work.Action{buildAction},
-			Package: pmain,
-			Target:  target,
+		if target == os.DevNull {
+			runAction = buildAction
+		} else {
+			pmain.Target = target
+			installAction = &work.Action{
+				Mode:    "test build",
+				Func:    work.BuildInstallFunc,
+				Deps:    []*work.Action{buildAction},
+				Package: pmain,
+				Target:  target,
+			}
+			runAction = installAction // make sure runAction != nil even if not running test
 		}
-		runAction = installAction // make sure runAction != nil even if not running test
 	}
+	var vetRunAction *work.Action
 	if testC {
 		printAction = &work.Action{Mode: "test print (nop)", Package: p, Deps: []*work.Action{runAction}} // nop
+		vetRunAction = printAction
 	} else {
 		// run test
 		c := new(runCache)
@@ -1103,12 +902,7 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 			TryCache:   c.tryCache,
 			Objdir:     testDir,
 		}
-		if len(ptest.GoFiles)+len(ptest.CgoFiles) > 0 {
-			addTestVet(b, ptest, runAction, installAction)
-		}
-		if pxtest != nil {
-			addTestVet(b, pxtest, runAction, installAction)
-		}
+		vetRunAction = runAction
 		cleanAction = &work.Action{
 			Mode:       "test clean",
 			Func:       builderCleanTest,
@@ -1125,6 +919,14 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 			IgnoreFail: true, // print even if test failed
 		}
 	}
+
+	if len(ptest.GoFiles)+len(ptest.CgoFiles) > 0 {
+		addTestVet(b, ptest, vetRunAction, installAction)
+	}
+	if pxtest != nil {
+		addTestVet(b, pxtest, vetRunAction, installAction)
+	}
+
 	if installAction != nil {
 		if runAction != installAction {
 			installAction.Deps = append(installAction.Deps, runAction)
@@ -1153,62 +955,6 @@ func addTestVet(b *work.Builder, p *load.Package, runAction, installAction *work
 	}
 }
 
-func testImportStack(top string, p *load.Package, target string) []string {
-	stk := []string{top, p.ImportPath}
-Search:
-	for p.ImportPath != target {
-		for _, p1 := range p.Internal.Imports {
-			if p1.ImportPath == target || str.Contains(p1.Deps, target) {
-				stk = append(stk, p1.ImportPath)
-				p = p1
-				continue Search
-			}
-		}
-		// Can't happen, but in case it does...
-		stk = append(stk, "<lost path to cycle>")
-		break
-	}
-	return stk
-}
-
-func recompileForTest(pmain, preal, ptest, pxtest *load.Package) {
-	// The "test copy" of preal is ptest.
-	// For each package that depends on preal, make a "test copy"
-	// that depends on ptest. And so on, up the dependency tree.
-	testCopy := map[*load.Package]*load.Package{preal: ptest}
-	for _, p := range load.PackageList([]*load.Package{pmain}) {
-		if p == preal {
-			continue
-		}
-		// Copy on write.
-		didSplit := p == pmain || p == pxtest
-		split := func() {
-			if didSplit {
-				return
-			}
-			didSplit = true
-			if testCopy[p] != nil {
-				panic("recompileForTest loop")
-			}
-			p1 := new(load.Package)
-			testCopy[p] = p1
-			*p1 = *p
-			p1.Internal.Imports = make([]*load.Package, len(p.Internal.Imports))
-			copy(p1.Internal.Imports, p.Internal.Imports)
-			p = p1
-			p.Target = ""
-		}
-
-		// Update p.Internal.Imports to use test copies.
-		for i, imp := range p.Internal.Imports {
-			if p1 := testCopy[imp]; p1 != nil && p1 != imp {
-				split()
-				p.Internal.Imports[i] = p1
-			}
-		}
-	}
-}
-
 // isTestFile reports whether the source file is a set of tests and should therefore
 // be excluded from coverage analysis.
 func isTestFile(file string) bool {
@@ -1218,16 +964,35 @@ func isTestFile(file string) bool {
 
 // declareCoverVars attaches the required cover variables names
 // to the files, to be used when annotating the files.
-func declareCoverVars(importPath string, files ...string) map[string]*load.CoverVar {
+func declareCoverVars(p *load.Package, files ...string) map[string]*load.CoverVar {
 	coverVars := make(map[string]*load.CoverVar)
 	coverIndex := 0
+	// We create the cover counters as new top-level variables in the package.
+	// We need to avoid collisions with user variables (GoCover_0 is unlikely but still)
+	// and more importantly with dot imports of other covered packages,
+	// so we append 12 hex digits from the SHA-256 of the import path.
+	// The point is only to avoid accidents, not to defeat users determined to
+	// break things.
+	sum := sha256.Sum256([]byte(p.ImportPath))
+	h := fmt.Sprintf("%x", sum[:6])
 	for _, file := range files {
 		if isTestFile(file) {
 			continue
 		}
+		// For a package that is "local" (imported via ./ import or command line, outside GOPATH),
+		// we record the full path to the file name.
+		// Otherwise we record the import path, then a forward slash, then the file name.
+		// This makes profiles within GOPATH file system-independent.
+		// These names appear in the cmd/cover HTML interface.
+		var longFile string
+		if p.Internal.Local {
+			longFile = filepath.Join(p.Dir, file)
+		} else {
+			longFile = path.Join(p.ImportPath, file)
+		}
 		coverVars[file] = &load.CoverVar{
-			File: filepath.Join(importPath, file),
-			Var:  fmt.Sprintf("GoCover_%d", coverIndex),
+			File: longFile,
+			Var:  fmt.Sprintf("GoCover_%d_%x", coverIndex, h),
 		}
 		coverIndex++
 	}
@@ -1644,7 +1409,7 @@ func computeTestInputsID(a *work.Action, testlog []byte) (cache.ActionID, error)
 			fmt.Fprintf(h, "env %s %x\n", name, hashGetenv(name))
 		case "chdir":
 			pwd = name // always absolute
-			fmt.Fprintf(h, "cbdir %s %x\n", name, hashStat(name))
+			fmt.Fprintf(h, "chdir %s %x\n", name, hashStat(name))
 		case "stat":
 			if !filepath.IsAbs(name) {
 				name = filepath.Join(pwd, name)
@@ -1852,310 +1617,3 @@ func builderNoTest(b *work.Builder, a *work.Action) error {
 	fmt.Fprintf(stdout, "?   \t%s\t[no test files]\n", a.Package.ImportPath)
 	return nil
 }
-
-// isTestFunc tells whether fn has the type of a testing function. arg
-// specifies the parameter type we look for: B, M or T.
-func isTestFunc(fn *ast.FuncDecl, arg string) bool {
-	if fn.Type.Results != nil && len(fn.Type.Results.List) > 0 ||
-		fn.Type.Params.List == nil ||
-		len(fn.Type.Params.List) != 1 ||
-		len(fn.Type.Params.List[0].Names) > 1 {
-		return false
-	}
-	ptr, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
-	if !ok {
-		return false
-	}
-	// We can't easily check that the type is *testing.M
-	// because we don't know how testing has been imported,
-	// but at least check that it's *M or *something.M.
-	// Same applies for B and T.
-	if name, ok := ptr.X.(*ast.Ident); ok && name.Name == arg {
-		return true
-	}
-	if sel, ok := ptr.X.(*ast.SelectorExpr); ok && sel.Sel.Name == arg {
-		return true
-	}
-	return false
-}
-
-// isTest tells whether name looks like a test (or benchmark, according to prefix).
-// It is a Test (say) if there is a character after Test that is not a lower-case letter.
-// We don't want TesticularCancer.
-func isTest(name, prefix string) bool {
-	if !strings.HasPrefix(name, prefix) {
-		return false
-	}
-	if len(name) == len(prefix) { // "Test" is ok
-		return true
-	}
-	rune, _ := utf8.DecodeRuneInString(name[len(prefix):])
-	return !unicode.IsLower(rune)
-}
-
-type coverInfo struct {
-	Package *load.Package
-	Vars    map[string]*load.CoverVar
-}
-
-// loadTestFuncs returns the testFuncs describing the tests that will be run.
-func loadTestFuncs(ptest *load.Package) (*testFuncs, error) {
-	t := &testFuncs{
-		Package: ptest,
-	}
-	for _, file := range ptest.TestGoFiles {
-		if err := t.load(filepath.Join(ptest.Dir, file), "_test", &t.ImportTest, &t.NeedTest); err != nil {
-			return nil, err
-		}
-	}
-	for _, file := range ptest.XTestGoFiles {
-		if err := t.load(filepath.Join(ptest.Dir, file), "_xtest", &t.ImportXtest, &t.NeedXtest); err != nil {
-			return nil, err
-		}
-	}
-	return t, nil
-}
-
-// writeTestmain writes the _testmain.go file for t to the file named out.
-func writeTestmain(out string, t *testFuncs) error {
-	f, err := os.Create(out)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if err := testmainTmpl.Execute(f, t); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-type testFuncs struct {
-	Tests       []testFunc
-	Benchmarks  []testFunc
-	Examples    []testFunc
-	TestMain    *testFunc
-	Package     *load.Package
-	ImportTest  bool
-	NeedTest    bool
-	ImportXtest bool
-	NeedXtest   bool
-	Cover       []coverInfo
-}
-
-func (t *testFuncs) CoverMode() string {
-	return testCoverMode
-}
-
-func (t *testFuncs) CoverEnabled() bool {
-	return testCover
-}
-
-// ImportPath returns the import path of the package being tested, if it is within GOPATH.
-// This is printed by the testing package when running benchmarks.
-func (t *testFuncs) ImportPath() string {
-	pkg := t.Package.ImportPath
-	if strings.HasPrefix(pkg, "_/") {
-		return ""
-	}
-	if pkg == "command-line-arguments" {
-		return ""
-	}
-	return pkg
-}
-
-// Covered returns a string describing which packages are being tested for coverage.
-// If the covered package is the same as the tested package, it returns the empty string.
-// Otherwise it is a comma-separated human-readable list of packages beginning with
-// " in", ready for use in the coverage message.
-func (t *testFuncs) Covered() string {
-	if testCoverPaths == nil {
-		return ""
-	}
-	return " in " + strings.Join(testCoverPaths, ", ")
-}
-
-// Tested returns the name of the package being tested.
-func (t *testFuncs) Tested() string {
-	return t.Package.Name
-}
-
-type testFunc struct {
-	Package   string // imported package name (_test or _xtest)
-	Name      string // function name
-	Output    string // output, for examples
-	Unordered bool   // output is allowed to be unordered.
-}
-
-var testFileSet = token.NewFileSet()
-
-func (t *testFuncs) load(filename, pkg string, doImport, seen *bool) error {
-	f, err := parser.ParseFile(testFileSet, filename, nil, parser.ParseComments)
-	if err != nil {
-		return base.ExpandScanner(err)
-	}
-	for _, d := range f.Decls {
-		n, ok := d.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if n.Recv != nil {
-			continue
-		}
-		name := n.Name.String()
-		switch {
-		case name == "TestMain":
-			if isTestFunc(n, "T") {
-				t.Tests = append(t.Tests, testFunc{pkg, name, "", false})
-				*doImport, *seen = true, true
-				continue
-			}
-			err := checkTestFunc(n, "M")
-			if err != nil {
-				return err
-			}
-			if t.TestMain != nil {
-				return errors.New("multiple definitions of TestMain")
-			}
-			t.TestMain = &testFunc{pkg, name, "", false}
-			*doImport, *seen = true, true
-		case isTest(name, "Test"):
-			err := checkTestFunc(n, "T")
-			if err != nil {
-				return err
-			}
-			t.Tests = append(t.Tests, testFunc{pkg, name, "", false})
-			*doImport, *seen = true, true
-		case isTest(name, "Benchmark"):
-			err := checkTestFunc(n, "B")
-			if err != nil {
-				return err
-			}
-			t.Benchmarks = append(t.Benchmarks, testFunc{pkg, name, "", false})
-			*doImport, *seen = true, true
-		}
-	}
-	ex := doc.Examples(f)
-	sort.Slice(ex, func(i, j int) bool { return ex[i].Order < ex[j].Order })
-	for _, e := range ex {
-		*doImport = true // import test file whether executed or not
-		if e.Output == "" && !e.EmptyOutput {
-			// Don't run examples with no output.
-			continue
-		}
-		t.Examples = append(t.Examples, testFunc{pkg, "Example" + e.Name, e.Output, e.Unordered})
-		*seen = true
-	}
-	return nil
-}
-
-func checkTestFunc(fn *ast.FuncDecl, arg string) error {
-	if !isTestFunc(fn, arg) {
-		name := fn.Name.String()
-		pos := testFileSet.Position(fn.Pos())
-		return fmt.Errorf("%s: wrong signature for %s, must be: func %s(%s *testing.%s)", pos, name, name, strings.ToLower(arg), arg)
-	}
-	return nil
-}
-
-var testmainTmpl = template.Must(template.New("main").Parse(`
-package main
-
-import (
-{{if not .TestMain}}
-	"os"
-{{end}}
-	"testing"
-	"testing/internal/testdeps"
-
-{{if .ImportTest}}
-	{{if .NeedTest}}_test{{else}}_{{end}} {{.Package.ImportPath | printf "%q"}}
-{{end}}
-{{if .ImportXtest}}
-	{{if .NeedXtest}}_xtest{{else}}_{{end}} {{.Package.ImportPath | printf "%s_test" | printf "%q"}}
-{{end}}
-{{range $i, $p := .Cover}}
-	_cover{{$i}} {{$p.Package.ImportPath | printf "%q"}}
-{{end}}
-)
-
-var tests = []testing.InternalTest{
-{{range .Tests}}
-	{"{{.Name}}", {{.Package}}.{{.Name}}},
-{{end}}
-}
-
-var benchmarks = []testing.InternalBenchmark{
-{{range .Benchmarks}}
-	{"{{.Name}}", {{.Package}}.{{.Name}}},
-{{end}}
-}
-
-var examples = []testing.InternalExample{
-{{range .Examples}}
-	{"{{.Name}}", {{.Package}}.{{.Name}}, {{.Output | printf "%q"}}, {{.Unordered}}},
-{{end}}
-}
-
-func init() {
-	testdeps.ImportPath = {{.ImportPath | printf "%q"}}
-}
-
-{{if .CoverEnabled}}
-
-// Only updated by init functions, so no need for atomicity.
-var (
-	coverCounters = make(map[string][]uint32)
-	coverBlocks = make(map[string][]testing.CoverBlock)
-)
-
-func init() {
-	{{range $i, $p := .Cover}}
-	{{range $file, $cover := $p.Vars}}
-	coverRegisterFile({{printf "%q" $cover.File}}, _cover{{$i}}.{{$cover.Var}}.Count[:], _cover{{$i}}.{{$cover.Var}}.Pos[:], _cover{{$i}}.{{$cover.Var}}.NumStmt[:])
-	{{end}}
-	{{end}}
-}
-
-func coverRegisterFile(fileName string, counter []uint32, pos []uint32, numStmts []uint16) {
-	if 3*len(counter) != len(pos) || len(counter) != len(numStmts) {
-		panic("coverage: mismatched sizes")
-	}
-	if coverCounters[fileName] != nil {
-		// Already registered.
-		return
-	}
-	coverCounters[fileName] = counter
-	block := make([]testing.CoverBlock, len(counter))
-	for i := range counter {
-		block[i] = testing.CoverBlock{
-			Line0: pos[3*i+0],
-			Col0: uint16(pos[3*i+2]),
-			Line1: pos[3*i+1],
-			Col1: uint16(pos[3*i+2]>>16),
-			Stmts: numStmts[i],
-		}
-	}
-	coverBlocks[fileName] = block
-}
-{{end}}
-
-func main() {
-{{if .CoverEnabled}}
-	testing.RegisterCover(testing.Cover{
-		Mode: {{printf "%q" .CoverMode}},
-		Counters: coverCounters,
-		Blocks: coverBlocks,
-		CoveredPackages: {{printf "%q" .Covered}},
-	})
-{{end}}
-	m := testing.MainStart(testdeps.TestDeps{}, tests, benchmarks, examples)
-{{with .TestMain}}
-	{{.Package}}.{{.Name}}(m)
-{{else}}
-	os.Exit(m.Run())
-{{end}}
-}
-
-`))

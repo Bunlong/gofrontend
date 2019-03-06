@@ -116,7 +116,7 @@ __go_get_backtrace_state ()
 	 argv[0] (http://gcc.gnu.org/PR61895).  It would be nice to
 	 have a better check for whether this file is the real
 	 executable.  */
-      if (stat (filename, &s) < 0 || s.st_size < 1024)
+      if (filename != NULL && (stat (filename, &s) < 0 || s.st_size < 1024))
 	filename = NULL;
 
       back_state = backtrace_create_state (filename, 1, error_callback, NULL);
@@ -129,18 +129,28 @@ __go_get_backtrace_state ()
    is the entry on the stack of inlined functions; -1 means the last
    one.  */
 
-_Bool
+static _Bool
 __go_file_line (uintptr pc, int index, String *fn, String *file, intgo *line)
 {
   struct caller c;
+  struct backtrace_state *state;
 
   runtime_memclr (&c, sizeof c);
   c.index = index;
-  backtrace_pcinfo (__go_get_backtrace_state (), pc, callback,
-		    error_callback, &c);
+  runtime_xadd (&__go_runtime_in_callers, 1);
+  state = __go_get_backtrace_state ();
+  runtime_xadd (&__go_runtime_in_callers, -1);
+  backtrace_pcinfo (state, pc, callback, error_callback, &c);
   *fn = c.fn;
   *file = c.file;
   *line = c.line;
+
+  // If backtrace_pcinfo didn't get the function name from the debug
+  // info, try to get it from the symbol table.
+  if (fn->len == 0)
+    backtrace_syminfo (state, pc, __go_syminfo_fnname_callback,
+		       error_callback, fn);
+
   return c.file.len > 0;
 }
 
@@ -161,8 +171,13 @@ syminfo_callback (void *data, uintptr_t pc __attribute__ ((unused)),
 static _Bool
 __go_symbol_value (uintptr pc, uintptr *val)
 {
+  struct backtrace_state *state;
+
   *val = 0;
-  backtrace_syminfo (__go_get_backtrace_state (), pc, syminfo_callback,
+  runtime_xadd (&__go_runtime_in_callers, 1);
+  state = __go_get_backtrace_state ();
+  runtime_xadd (&__go_runtime_in_callers, -1);
+  backtrace_syminfo (state, pc, syminfo_callback,
 		     error_callback, val);
   return *val != 0;
 }
@@ -177,12 +192,12 @@ struct caller_ret
   _Bool ok;
 };
 
-struct caller_ret Caller (int n) __asm__ (GOSYM_PREFIX "runtime.Caller");
+struct caller_ret Caller (intgo n) __asm__ (GOSYM_PREFIX "runtime.Caller");
 
 /* Implement runtime.Caller.  */
 
 struct caller_ret
-Caller (int skip)
+Caller (intgo skip)
 {
   struct caller_ret ret;
   Location loc;
@@ -200,17 +215,6 @@ Caller (int skip)
 }
 
 /* Look up the function name, file name, and line number for a PC.  */
-
-struct funcfileline_return
-{
-  String retfn;
-  String retfile;
-  intgo retline;
-};
-
-struct funcfileline_return
-runtime_funcfileline (uintptr targetpc, int32 index)
-  __asm__ (GOSYM_PREFIX "runtime.funcfileline");
 
 struct funcfileline_return
 runtime_funcfileline (uintptr targetpc, int32 index)

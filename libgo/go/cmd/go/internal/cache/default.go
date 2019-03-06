@@ -5,12 +5,13 @@
 package cache
 
 import (
-	"cmd/go/internal/base"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
+
+	"cmd/go/internal/base"
 )
 
 // Default returns the default cache to use, or nil if no cache should be used.
@@ -36,11 +37,14 @@ See golang.org to learn more about Go.
 // the first time Default is called.
 func initDefaultCache() {
 	dir := DefaultDir()
-	if dir == "off" {
-		return
+	if dir == "off" || dir == "" {
+		if defaultDirErr != nil {
+			base.Fatalf("build cache is required, but could not be located: %v", defaultDirErr)
+		}
+		base.Fatalf("build cache is disabled by GOCACHE=off, but required as of Go 1.12")
 	}
 	if err := os.MkdirAll(dir, 0777); err != nil {
-		base.Fatalf("initializing cache in $GOCACHE: %s", err)
+		base.Fatalf("failed to initialize build cache at %s: %s\n", dir, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "README")); err != nil {
 		// Best effort.
@@ -49,55 +53,40 @@ func initDefaultCache() {
 
 	c, err := Open(dir)
 	if err != nil {
-		base.Fatalf("initializing cache in $GOCACHE: %s", err)
+		base.Fatalf("failed to initialize build cache at %s: %s\n", dir, err)
 	}
 	defaultCache = c
 }
 
+var (
+	defaultDirOnce sync.Once
+	defaultDir     string
+	defaultDirErr  error
+)
+
 // DefaultDir returns the effective GOCACHE setting.
 // It returns "off" if the cache is disabled.
 func DefaultDir() string {
-	dir := os.Getenv("GOCACHE")
-	if dir != "" {
-		return dir
-	}
+	// Save the result of the first call to DefaultDir for later use in
+	// initDefaultCache. cmd/go/main.go explicitly sets GOCACHE so that
+	// subprocesses will inherit it, but that means initDefaultCache can't
+	// otherwise distinguish between an explicit "off" and a UserCacheDir error.
 
-	// Compute default location.
-	// TODO(rsc): This code belongs somewhere else,
-	// like maybe ioutil.CacheDir or os.CacheDir.
-	switch runtime.GOOS {
-	case "windows":
-		dir = os.Getenv("LocalAppData")
-		if dir == "" {
-			return "off"
+	defaultDirOnce.Do(func() {
+		defaultDir = os.Getenv("GOCACHE")
+		if defaultDir != "" {
+			return
 		}
 
-	case "darwin":
-		dir = os.Getenv("HOME")
-		if dir == "" {
-			return "off"
+		// Compute default location.
+		dir, err := os.UserCacheDir()
+		if err != nil {
+			defaultDir = "off"
+			defaultDirErr = fmt.Errorf("GOCACHE is not defined and %v", err)
+			return
 		}
-		dir += "/Library/Caches"
+		defaultDir = filepath.Join(dir, "go-build")
+	})
 
-	case "plan9":
-		dir = os.Getenv("home")
-		if dir == "" {
-			return "off"
-		}
-		// Plan 9 has no established per-user cache directory,
-		// but $home/lib/xyz is the usual equivalent of $HOME/.xyz on Unix.
-		dir += "/lib/cache"
-
-	default: // Unix
-		// https://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html
-		dir = os.Getenv("XDG_CACHE_HOME")
-		if dir == "" {
-			dir = os.Getenv("HOME")
-			if dir == "" {
-				return "off"
-			}
-			dir += "/.cache"
-		}
-	}
-	return filepath.Join(dir, "go-build")
+	return defaultDir
 }

@@ -5,6 +5,9 @@
 // +build !plan9
 // +build !windows
 // +build !nacl
+// +build !js
+// +build !darwin
+// +build !aix
 
 package runtime
 
@@ -16,7 +19,6 @@ func closefd(fd int32) int32
 
 //extern exit
 func exit(code int32)
-func nanotime() int64
 func usleep(usec uint32)
 
 //go:noescape

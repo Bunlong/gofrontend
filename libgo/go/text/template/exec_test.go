@@ -74,6 +74,7 @@ type T struct {
 	VariadicFuncInt func(int, ...string) string
 	NilOKFunc       func(*int) bool
 	ErrFunc         func() (string, error)
+	PanicFunc       func() string
 	// Template to test evaluation of templates.
 	Tmpl *Template
 	// Unexported field; cannot be accessed by template.
@@ -156,6 +157,7 @@ var tVal = &T{
 	VariadicFuncInt:      func(a int, s ...string) string { return fmt.Sprint(a, "=<", strings.Join(s, "+"), ">") },
 	NilOKFunc:            func(s *int) bool { return s == nil },
 	ErrFunc:              func() (string, error) { return "bla", nil },
+	PanicFunc:            func() string { panic("test panic") },
 	Tmpl:                 Must(New("x").Parse("test template")), // "x" is the value of .X
 }
 
@@ -304,6 +306,13 @@ var execTests = []execTest{
 	{"$.I", "{{$.I}}", "17", tVal, true},
 	{"$.U.V", "{{$.U.V}}", "v", tVal, true},
 	{"declare in action", "{{$x := $.U.V}}{{$x}}", "v", tVal, true},
+	{"simple assignment", "{{$x := 2}}{{$x = 3}}{{$x}}", "3", tVal, true},
+	{"nested assignment",
+		"{{$x := 2}}{{if true}}{{$x = 3}}{{end}}{{$x}}",
+		"3", tVal, true},
+	{"nested assignment changes the last declaration",
+		"{{$x := 1}}{{if true}}{{$x := 2}}{{if true}}{{$x = 3}}{{end}}{{end}}{{$x}}",
+		"1", tVal, true},
 
 	// Type with String method.
 	{"V{6666}.String()", "-{{.V0}}-", "-<6666>-", tVal, true},
@@ -329,6 +338,10 @@ var execTests = []execTest{
 	{"empty with slice", "{{.Empty3}}", "[7 8]", tVal, true},
 	{"empty with struct", "{{.Empty4}}", "{UinEmpty}", tVal, true},
 	{"empty with struct, field", "{{.Empty4.V}}", "UinEmpty", tVal, true},
+
+	// Edge cases with <no value> with an interface value
+	{"field on interface", "{{.foo}}", "<no value>", nil, true},
+	{"field on parenthesized interface", "{{(.).foo}}", "<no value>", nil, true},
 
 	// Method calls.
 	{".Method0", "-{{.Method0}}-", "-M0-", tVal, true},
@@ -377,6 +390,11 @@ var execTests = []execTest{
 	// Pipelines.
 	{"pipeline", "-{{.Method0 | .Method2 .U16}}-", "-Method2: 16 M0-", tVal, true},
 	{"pipeline func", "-{{call .VariadicFunc `llo` | call .VariadicFunc `he` }}-", "-<he+<llo>>-", tVal, true},
+
+	// Nil values aren't missing arguments.
+	{"nil pipeline", "{{ .Empty0 | call .NilOKFunc }}", "true", tVal, true},
+	{"nil call arg", "{{ call .NilOKFunc .Empty0 }}", "true", tVal, true},
+	{"bad nil pipeline", "{{ .Empty0 | .VariadicFunc }}", "", tVal, false},
 
 	// Parenthesized expressions
 	{"parens in pipeline", "{{printf `%d %d %d` (1) (2 | add 3) (add 4 (add 5 6))}}", "1 5 15", tVal, true},
@@ -432,6 +450,8 @@ var execTests = []execTest{
 	{"html pipeline", `{{printf "<script>alert(\"XSS\");</script>" | html}}`,
 		"&lt;script&gt;alert(&#34;XSS&#34;);&lt;/script&gt;", nil, true},
 	{"html", `{{html .PS}}`, "a string", tVal, true},
+	{"html typed nil", `{{html .NIL}}`, "&lt;nil&gt;", tVal, true},
+	{"html untyped nil", `{{html .Empty0}}`, "&lt;no value&gt;", tVal, true},
 
 	// JavaScript.
 	{"js", `{{js .}}`, `It\'d be nice.`, `It'd be nice.`, true},
@@ -513,10 +533,6 @@ var execTests = []execTest{
 	{"declare in range", "{{range $x := .PSI}}<{{$foo:=$x}}{{$x}}>{{end}}", "<21><22><23>", tVal, true},
 	{"range count", `{{range $i, $x := count 5}}[{{$i}}]{{$x}}{{end}}`, "[0]a[1]b[2]c[3]d[4]e", tVal, true},
 	{"range nil count", `{{range $i, $x := count 0}}{{else}}empty{{end}}`, "empty", tVal, true},
-	{"range quick break", `{{range .SI}}{{break}}{{.}}{{end}}`, "", tVal, true},
-	{"range break after two", `{{range $i, $x := .SI}}{{if ge $i 2}}{{break}}{{end}}{{.}}{{end}}`, "34", tVal, true},
-	{"range continue", `{{range .SI}}{{continue}}{{.}}{{end}}`, "", tVal, true},
-	{"range continue condition", `{{range .SI}}{{if eq . 3 }}{{continue}}{{end}}{{.}}{{end}}`, "45", tVal, true},
 
 	// Cute examples.
 	{"or as if true", `{{or .SI "slice is empty"}}`, "[3 4 5]", tVal, true},
@@ -1265,6 +1281,7 @@ func TestBadFuncNames(t *testing.T) {
 }
 
 func testBadFuncName(name string, t *testing.T) {
+	t.Helper()
 	defer func() {
 		recover()
 	}()
@@ -1433,6 +1450,63 @@ func TestInterfaceValues(t *testing.T) {
 		}
 		if buf.String() != tt.out {
 			t.Errorf("%s: template output = %q, want %q", tt.text, &buf, tt.out)
+		}
+	}
+}
+
+// Check that panics during calls are recovered and returned as errors.
+func TestExecutePanicDuringCall(t *testing.T) {
+	funcs := map[string]interface{}{
+		"doPanic": func() string {
+			panic("custom panic string")
+		},
+	}
+	tests := []struct {
+		name    string
+		input   string
+		data    interface{}
+		wantErr string
+	}{
+		{
+			"direct func call panics",
+			"{{doPanic}}", (*T)(nil),
+			`template: t:1:2: executing "t" at <doPanic>: error calling doPanic: custom panic string`,
+		},
+		{
+			"indirect func call panics",
+			"{{call doPanic}}", (*T)(nil),
+			`template: t:1:7: executing "t" at <doPanic>: error calling doPanic: custom panic string`,
+		},
+		{
+			"direct method call panics",
+			"{{.GetU}}", (*T)(nil),
+			`template: t:1:2: executing "t" at <.GetU>: error calling GetU: runtime error: `,
+		},
+		{
+			"indirect method call panics",
+			"{{call .GetU}}", (*T)(nil),
+			`template: t:1:7: executing "t" at <.GetU>: error calling GetU: runtime error: `,
+		},
+		{
+			"func field call panics",
+			"{{call .PanicFunc}}", tVal,
+			`template: t:1:2: executing "t" at <call .PanicFunc>: error calling call: test panic`,
+		},
+	}
+	for _, tc := range tests {
+		b := new(bytes.Buffer)
+		tmpl, err := New("t").Funcs(funcs).Parse(tc.input)
+		if err != nil {
+			t.Fatalf("parse error: %s", err)
+		}
+		err = tmpl.Execute(b, tc.data)
+		if err == nil {
+			t.Errorf("%s: expected error; got none", tc.name)
+		} else if !strings.Contains(err.Error(), tc.wantErr) {
+			if *debug {
+				fmt.Printf("%s: test execute error: %s\n", tc.name, err)
+			}
+			t.Errorf("%s: expected error:\n%s\ngot:\n%s", tc.name, tc.wantErr, err)
 		}
 	}
 }
